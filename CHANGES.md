@@ -1,8 +1,61 @@
 # Release Notes
 
 ## Next
+
+## 0.45.0 - 2026-08-21
+
+* `spark-4.1-bigquery` is generally available!
+* Issue #1501: Preserved detailed row errors from failed direct writes
+* Issue #1503: Corrected the documented billing project option to `parentProject`.
+* PR #1494: Added Support for Change Data Capture (CDC)
+* PR #1510: Handle Arrow StructVectors with 0 child vectors in ArrowColumnBatchPartitionReaderContext
+* PR #1512: Fixed a schema-resolution error on Spark 3.5 when reading a nested
+  STRUCT column with a filter Spark cannot push down (e.g. `struct_col IS NOT
+  NULL`). The DataSource V2 reader now honors Spark's nested schema pruning and
+  pushes matching nested `selected_fields` to the BigQuery Storage Read API.
+* PR #1512: Kept reader-owned Arrow vectors open between reusable columnar
+  batches on Spark 4.
+* BigQuery API has been upgraded to version 2.69.0
+* BigQuery Storage API has been upgraded to version 3.30.0
+* GAX has been upgraded to version 2.82.0
+* gRPC has been upgraded to version 1.83.1
+* Guava has been upgraded to version 33.6.0-jre
+* Netty has been upgraded to version 4.2.17.Final
+* Protocol Buffers has been upgraded to version 4.35.1
+
+
+## 0.44.2 - 2026-05-20
+
+* Issue #1389: Fixed Timestamp Conversion from Julian to Gregorian conversion
+* Issue #1476: Fixed BigQuery MERGE statement ambiguity on overwrite when table columns are named `target` or `source`.
+* PR #1479: Fixing NotSerializableException thrown on the executors
+* PR #1488: Added timing and Job ID logging to write path operations
+* BigQuery API has been upgraded to version 2.65.0
+* BigQuery Storage API has been upgraded to version 3.27.0
+* GAX has been upgraded to version 2.79.0
+* gRPC has been upgraded to version 1.81.0
+* Guava has been upgraded to version 33.6.0-jre
+* Netty has been upgraded to version 4.2.12.Final
+* Protocol Buffers has been upgraded to version 4.34.1
+* Avro has been upgraded to version 1.11.5
+
+## 0.44.1 - 2026-03-25
+* BigQuery API has been upgraded to version 2.60.0
+* BigQuery Storage API has been upgraded to version 3.22.1
+* GAX has been upgraded to version 2.75.0
+* gRPC has been upgraded to version 1.79.0
+* Guava has been upgraded to version 33.5.0-jre
+* Netty has been upgraded to version 4.2.10.Final
+* Protocol Buffers has been upgraded to version 4.34.0
+* google-api-client has been upgraded to version 2.9.0
+
+## 0.44.0 - 2026-02-11
 * Added new connector, `spark-4.1-bigquery` aimed to be used in Spark 4.1. Like Spark 4.1, this connector requires at
   least Java 17 runtime. It is currently in preview mode.
+* `spark-4.0-bigquery` is generally available!
+* PR #1445: Add streaming support for Spark DS v2 indirect write.
+* PR #1452: Improved the performance of the dynamic partition overwrite for RANGE_BUCKET partitioned tables.
+* PR #1434: Support per-catalog configuration for project and location for BigQueryCatalog.
 
 ## 0.43.1 - 2025-10-22
 * Issue #1417: Fixed ClassCastException in AWS federated identity
@@ -17,6 +70,9 @@
 * PR #1376: `materializationDataset` is now optional to read from views or queries.
 * PR #1380: Fixed ImpersonatedCredentials serialization
 * PR #1381: Added the option to set custom credentials scopes
+* PR #1400: Fixed issue #1379 by preventing indirect `SaveMode.Append` writes from updating table
+  metadata and requiring the `bigquery.tables.setCategory` permission; also fixed a redundant load
+  during dynamic partition overwrite.
 * PR #1411: Added Support for [SparkSession#executeCommand](https://archive.apache.org/dist/spark/docs/3.0.0/api/java/org/apache/spark/sql/SparkSession.html#executeCommand-java.lang.String-java.lang.String-scala.collection.immutable.Map-)
 * Issue #1421: Fix ArrowInputPartitionContext serialization issue. Thanks @mrjoe7 !
 * BigQuery API has been upgraded to version 2.54.0

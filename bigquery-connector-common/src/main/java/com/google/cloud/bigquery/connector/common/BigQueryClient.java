@@ -24,7 +24,6 @@ import com.google.api.client.googleapis.javanet.GoogleNetHttpTransport;
 import com.google.api.client.json.gson.GsonFactory;
 import com.google.api.services.bigquery.Bigquery;
 import com.google.auth.http.HttpCredentialsAdapter;
-import com.google.cloud.BaseServiceException;
 import com.google.cloud.RetryOption;
 import com.google.cloud.bigquery.BigQuery;
 import com.google.cloud.bigquery.BigQueryException;
@@ -162,7 +161,7 @@ public class BigQueryClient {
    *
    * @param job The {@code Job} to keep track of.
    */
-  public JobInfo waitForJob(Job job) {
+  public JobInfo waitForJob(Job job, JobOperation operation) {
     try {
       Job completedJob =
           job.waitFor(
@@ -178,6 +177,7 @@ public class BigQueryClient {
         throw new IllegalStateException(
             String.format("Job aborted due to timeout  : %s minutes", bigQueryJobTimeoutInMinutes));
       }
+      logJobTelemetry(completedJob, operation);
       jobCompletionListener.ifPresent(jcl -> jcl.accept(completedJob));
       return completedJob;
     } catch (InterruptedException e) {
@@ -462,7 +462,10 @@ public class BigQueryClient {
       validateViewsEnabled(options);
       String sql = query.get();
       return materializeQueryToTable(
-          sql, options.expirationTimeInMinutes(), options.getQueryParameterHelper());
+          sql,
+          options.expirationTimeInMinutes(),
+          options.getQueryParameterHelper(),
+          options.getKmsKeyName());
     }
 
     TableInfo table = getTable(options.tableId());
@@ -504,7 +507,8 @@ public class BigQueryClient {
     if (query.isPresent()) {
       validateViewsEnabled(options);
       String sql = query.get();
-      return getQueryResultSchema(sql, Collections.emptyMap(), options.getQueryParameterHelper());
+      return getQueryResultSchema(
+          sql, Collections.emptyMap(), options.getQueryParameterHelper(), options.getKmsKeyName());
     }
     TableInfo table = getReadTable(options);
     return table != null ? table.getDefinition().getSchema() : null;
@@ -549,16 +553,12 @@ public class BigQueryClient {
     return bigQuery.update(table);
   }
 
-  public Job createAndWaitFor(JobConfiguration.Builder jobConfiguration) {
-    return createAndWaitFor(jobConfiguration.build());
-  }
-
-  public Job createAndWaitFor(JobConfiguration jobConfiguration) {
+  public Job createAndWaitFor(JobConfiguration jobConfiguration, JobOperation operation) {
     JobInfo jobInfo = JobInfo.of(jobConfiguration);
     Job job = bigQuery.create(jobInfo);
-    Job returnedJob = null;
 
     log.info("Submitted job {}. jobId: {}", jobConfiguration, job.getJobId());
+
     try {
       Job completedJob = job.waitFor();
       if (completedJob == null) {
@@ -572,6 +572,7 @@ public class BigQueryClient {
             String.format(
                 "Failed to run the job [%s], due to '%s'", completedJob.getStatus().getError()));
       }
+      logJobTelemetry(completedJob, operation);
       return completedJob;
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
@@ -579,6 +580,26 @@ public class BigQueryClient {
           BaseHttpServiceException.UNKNOWN_CODE,
           String.format("Failed to run the job [%s], task was interrupted", job),
           e);
+    }
+  }
+
+  private void logJobTelemetry(Job completedJob, JobOperation operation) {
+    if (completedJob == null) {
+      return;
+    }
+    JobStatistics stats = completedJob.getStatistics();
+    if (stats != null && stats.getStartTime() != null && stats.getEndTime() != null) {
+      long duration = stats.getEndTime() - stats.getStartTime();
+      JobConfiguration config = completedJob.getConfiguration();
+      JobConfiguration.Type type = config != null ? config.getType() : null;
+      JobId jobId = completedJob.getJobId();
+      String jobIdStr = jobId != null ? jobId.getJob() : "unknown";
+      log.info(
+          "BigQuery {} job {} ({}) completed in {}ms",
+          type,
+          jobIdStr,
+          operation.getDescription(),
+          duration);
     }
   }
 
@@ -694,13 +715,20 @@ public class BigQueryClient {
    * Runs the provided query on BigQuery and saves the result in a temporary table.
    *
    * @param querySql the query to be run
+   * @param expirationTimeInMinutes the expiration time of the temporary table
+   * @param queryParameterHelper the query parameter helper
+   * @param kmsKeyName optional KMS key name to be used for encrypting the temporary table
    * @return a reference to the table
    */
   public TableInfo materializeQueryToTable(
-      String querySql, int expirationTimeInMinutes, QueryParameterHelper queryParameterHelper) {
+      String querySql,
+      int expirationTimeInMinutes,
+      QueryParameterHelper queryParameterHelper,
+      Optional<String> kmsKeyName) {
     Optional<TableId> tableId =
         materializationDataset.map(ignored -> createDestinationTableWithoutReference());
-    return materializeTable(querySql, tableId, expirationTimeInMinutes, queryParameterHelper);
+    return materializeTable(
+        querySql, tableId, expirationTimeInMinutes, queryParameterHelper, kmsKeyName);
   }
 
   TableId createDestinationTableWithoutReference() {
@@ -729,6 +757,27 @@ public class BigQueryClient {
       int expirationTimeInMinutes,
       Map<String, String> additionalQueryJobLabels,
       QueryParameterHelper queryParameterHelper) {
+    return materializeQueryToTable(
+        querySql,
+        expirationTimeInMinutes,
+        additionalQueryJobLabels,
+        queryParameterHelper,
+        Optional.empty());
+  }
+
+  /**
+   * Runs the provided query on BigQuery and saves the result in a temporary table.
+   *
+   * @param querySql the query to be run
+   * @param additionalQueryJobLabels the labels to insert on the query job
+   * @return a reference to the table
+   */
+  public TableInfo materializeQueryToTable(
+      String querySql,
+      int expirationTimeInMinutes,
+      Map<String, String> additionalQueryJobLabels,
+      QueryParameterHelper queryParameterHelper,
+      Optional<String> kmsKeyName) {
     Optional<TableId> destinationTableId =
         materializationDataset.map(ignored -> createDestinationTableWithoutReference());
     TempTableBuilder tableBuilder =
@@ -739,7 +788,8 @@ public class BigQueryClient {
             expirationTimeInMinutes,
             jobConfigurationFactory,
             additionalQueryJobLabels,
-            queryParameterHelper);
+            queryParameterHelper,
+            kmsKeyName);
 
     return materializeTable(querySql, tableBuilder);
   }
@@ -760,20 +810,36 @@ public class BigQueryClient {
         createDestinationTable(
             Optional.ofNullable(viewId.getProject()), Optional.ofNullable(viewId.getDataset()));
     return materializeTable(
-        querySql, Optional.of(tableId), expirationTimeInMinutes, QueryParameterHelper.none());
+        querySql,
+        Optional.of(tableId),
+        expirationTimeInMinutes,
+        QueryParameterHelper.none(),
+        Optional.empty());
   }
 
   public Schema getQueryResultSchema(
       String querySql,
       Map<String, String> additionalQueryJobLabels,
       QueryParameterHelper queryParameterHelper) {
-    JobInfo jobInfo =
-        JobInfo.of(
-            jobConfigurationFactory
-                .createParameterizedQueryJobConfigurationBuilder(
-                    querySql, additionalQueryJobLabels, queryParameterHelper)
-                .setDryRun(true)
-                .build());
+    return getQueryResultSchema(
+        querySql, additionalQueryJobLabels, queryParameterHelper, Optional.empty());
+  }
+
+  public Schema getQueryResultSchema(
+      String querySql,
+      Map<String, String> additionalQueryJobLabels,
+      QueryParameterHelper queryParameterHelper,
+      Optional<String> kmsKeyName) {
+    QueryJobConfiguration.Builder builder =
+        jobConfigurationFactory
+            .createParameterizedQueryJobConfigurationBuilder(
+                querySql, additionalQueryJobLabels, queryParameterHelper)
+            .setDryRun(true);
+    kmsKeyName.ifPresent(
+        k ->
+            builder.setDestinationEncryptionConfiguration(
+                EncryptionConfiguration.newBuilder().setKmsKeyName(k).build()));
+    JobInfo jobInfo = JobInfo.of(builder.build());
 
     log.info("running query dryRun {}", querySql);
     JobInfo completedJobInfo = create(jobInfo);
@@ -789,6 +855,20 @@ public class BigQueryClient {
       Optional<TableId> destinationTableId,
       int expirationTimeInMinutes,
       QueryParameterHelper queryParameterHelper) {
+    return materializeTable(
+        querySql,
+        destinationTableId,
+        expirationTimeInMinutes,
+        queryParameterHelper,
+        Optional.empty());
+  }
+
+  private TableInfo materializeTable(
+      String querySql,
+      Optional<TableId> destinationTableId,
+      int expirationTimeInMinutes,
+      QueryParameterHelper queryParameterHelper,
+      Optional<String> kmsKeyName) {
     try {
       return destinationTableCache.get(
           querySql,
@@ -799,7 +879,8 @@ public class BigQueryClient {
               expirationTimeInMinutes,
               jobConfigurationFactory,
               Collections.emptyMap(),
-              queryParameterHelper));
+              queryParameterHelper,
+              kmsKeyName));
     } catch (Exception e) {
       throw new BigQueryConnectorException(
           BigQueryErrorCode.BIGQUERY_VIEW_DESTINATION_TABLE_CREATION_FAILED,
@@ -891,7 +972,7 @@ public class BigQueryClient {
 
     Job finishedJob = null;
     try {
-      finishedJob = createAndWaitFor(jobConfiguration);
+      finishedJob = createAndWaitFor(jobConfiguration.build(), JobOperation.LOAD_DATA_FROM_GCS);
 
       if (finishedJob.getStatus().getError() != null) {
         throw new BigQueryException(
@@ -975,6 +1056,10 @@ public class BigQueryClient {
 
   public void createDataset(DatasetId datasetId, Map<String, String> metadata) {
     DatasetInfo.Builder datasetInfo = DatasetInfo.newBuilder(datasetId);
+    // In a non-catalog scenario, both BigQueryOptions.quotaProjectId and
+    // BigQueryOptions.projectId
+    // will be set to the parent projectId, as before.
+    Optional.ofNullable(bigQuery.getOptions().getLocation()).ifPresent(datasetInfo::setLocation);
     if (metadata != null && !metadata.isEmpty()) {
       Optional.ofNullable(metadata.get("bigquery_location")).ifPresent(datasetInfo::setLocation);
       Optional.ofNullable(metadata.get("comment")).ifPresent(datasetInfo::setDescription);
@@ -1006,6 +1091,10 @@ public class BigQueryClient {
     int expirationTimeInMinutes();
 
     QueryParameterHelper getQueryParameterHelper();
+
+    default Optional<String> getKmsKeyName() {
+      return Optional.empty();
+    }
   }
 
   public interface LoadDataOptions {
@@ -1083,6 +1172,7 @@ public class BigQueryClient {
     final JobConfigurationFactory jobConfigurationFactory;
     final Map<String, String> additionalQueryJobLabels;
     final QueryParameterHelper queryParameterHelper;
+    final Optional<String> kmsKeyName;
 
     TempTableBuilder(
         BigQueryClient bigQueryClient,
@@ -1092,6 +1182,26 @@ public class BigQueryClient {
         JobConfigurationFactory jobConfigurationFactory,
         Map<String, String> additionalQueryJobLabels,
         QueryParameterHelper queryParameterHelper) {
+      this(
+          bigQueryClient,
+          querySql,
+          tempTable,
+          expirationTimeInMinutes,
+          jobConfigurationFactory,
+          additionalQueryJobLabels,
+          queryParameterHelper,
+          Optional.empty());
+    }
+
+    TempTableBuilder(
+        BigQueryClient bigQueryClient,
+        String querySql,
+        Optional<TableId> tempTable,
+        int expirationTimeInMinutes,
+        JobConfigurationFactory jobConfigurationFactory,
+        Map<String, String> additionalQueryJobLabels,
+        QueryParameterHelper queryParameterHelper,
+        Optional<String> kmsKeyName) {
       this.bigQueryClient = bigQueryClient;
       this.querySql = querySql;
       this.tempTable = tempTable;
@@ -1099,6 +1209,7 @@ public class BigQueryClient {
       this.jobConfigurationFactory = jobConfigurationFactory;
       this.additionalQueryJobLabels = additionalQueryJobLabels;
       this.queryParameterHelper = queryParameterHelper;
+      this.kmsKeyName = kmsKeyName;
     }
 
     @Override
@@ -1116,11 +1227,16 @@ public class BigQueryClient {
           jobConfigurationFactory.createParameterizedQueryJobConfigurationBuilder(
               querySql, additionalQueryJobLabels, queryParameterHelper);
       tempTable.ifPresent(queryJobConfigurationBuilder::setDestinationTable);
+      kmsKeyName.ifPresent(
+          k ->
+              queryJobConfigurationBuilder.setDestinationEncryptionConfiguration(
+                  EncryptionConfiguration.newBuilder().setKmsKeyName(k).build()));
 
       JobInfo jobInfo = JobInfo.of(queryJobConfigurationBuilder.build());
 
       log.info("running query [{}]", querySql);
-      JobInfo completedJobInfo = bigQueryClient.waitForJob(bigQueryClient.create(jobInfo));
+      JobInfo completedJobInfo =
+          bigQueryClient.waitForJob(bigQueryClient.create(jobInfo), JobOperation.MATERIALIZE_QUERY);
       if (completedJobInfo.getStatus().getError() != null) {
         throw BigQueryUtil.convertToBigQueryException(completedJobInfo.getStatus().getError());
       }
@@ -1139,31 +1255,6 @@ public class BigQueryClient {
       // temp table was auto generated
       return bigQueryClient.getTable(
           ((QueryJobConfiguration) completedJobInfo.getConfiguration()).getDestinationTable());
-    }
-
-    Job waitForJob(Job job) {
-      try {
-        log.info(
-            "Job submitted : {}, {},  Job type : {}",
-            job.getJobId(),
-            job.getSelfLink(),
-            job.getConfiguration().getType());
-        Job completedJob = job.waitFor();
-        log.info(
-            "Job has finished {} creationTime : {}, startTime : {}, endTime : {} ",
-            completedJob.getJobId(),
-            completedJob.getStatistics().getCreationTime(),
-            completedJob.getStatistics().getStartTime(),
-            completedJob.getStatistics().getEndTime());
-        log.debug("Job has finished. {}", completedJob);
-        return completedJob;
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        throw new BigQueryException(
-            BaseServiceException.UNKNOWN_CODE,
-            String.format("Job %s has been interrupted", job.getJobId()),
-            e);
-      }
     }
   }
 

@@ -24,6 +24,7 @@ import com.google.cloud.bigquery.TableId;
 import com.google.cloud.bigquery.TableInfo;
 import com.google.cloud.bigquery.connector.common.BigQueryClient;
 import com.google.cloud.bigquery.connector.common.BigQueryUtil;
+import com.google.cloud.bigquery.connector.common.JobOperation;
 import com.google.cloud.spark.bigquery.AvroSchemaConverter;
 import com.google.cloud.spark.bigquery.PartitionOverwriteMode;
 import com.google.cloud.spark.bigquery.SchemaConverters;
@@ -35,6 +36,7 @@ import com.google.cloud.spark.bigquery.write.BigQueryWriteHelper;
 import com.google.cloud.spark.bigquery.write.IntermediateDataCleaner;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
@@ -95,6 +97,10 @@ public class BigQueryIndirectDataSourceWriterContext implements DataSourceWriter
     this.intermediateDataCleaner = intermediateDataCleaner;
     this.writeDisposition = SparkBigQueryUtil.saveModeToWriteDisposition(saveMode);
     this.sparkContext = sparkContext;
+    if (Arrays.stream(sparkSchema.fields()).anyMatch(SparkBigQueryUtil::isCdcPseudoColumn)) {
+      throw new IllegalArgumentException(
+          "CDC is only supported when writeMethod is DIRECT and writeAtLeastOnce is true.");
+    }
   }
 
   @Override
@@ -108,7 +114,46 @@ public class BigQueryIndirectDataSourceWriterContext implements DataSourceWriter
   }
 
   @Override
+  public void onDataStreamingWriterCommit(long epochId, WriterCommitMessageContext[] messages) {
+    commitMessages(messages, epochId);
+  }
+
+  @Override
+  public void onDataStreamingWriterAbort(long epochId, WriterCommitMessageContext[] messages) {
+    try {
+      logger.warn(
+          "Aborting epoch {} from streaming write {} for table {}",
+          epochId,
+          writeUUID,
+          BigQueryUtil.friendlyTableName(config.getTableId()));
+    } finally {
+      cleanTemporaryGcsPathIfNeeded(epochId);
+    }
+  }
+
+  @Override
   public void commit(WriterCommitMessageContext[] messages) {
+    commitMessages(messages, 0);
+  }
+
+  @Override
+  public void abort(WriterCommitMessageContext[] messages) {
+    try {
+      logger.warn(
+          "Aborting write {} for table {}",
+          writeUUID,
+          BigQueryUtil.friendlyTableName(config.getTableId()));
+    } finally {
+      cleanTemporaryGcsPathIfNeeded(0);
+    }
+  }
+
+  @Override
+  public void setTableInfo(TableInfo tableInfo) {
+    this.tableInfo = Optional.ofNullable(tableInfo);
+  }
+
+  private void commitMessages(WriterCommitMessageContext[] messages, long epochId) {
     logger.info(
         "Data has been successfully written to GCS. Going to load {} files to BigQuery",
         messages.length);
@@ -144,36 +189,18 @@ public class BigQueryIndirectDataSourceWriterContext implements DataSourceWriter
         Job queryJob =
             bigQueryClient.overwriteDestinationWithTemporaryDynamicPartitons(
                 temporaryTableId.get(), config.getTableId());
-        bigQueryClient.waitForJob(queryJob);
+        bigQueryClient.waitForJob(queryJob, JobOperation.DYNAMIC_PARTITION_OVERWRITE);
       } else {
         loadDataToBigQuery(sourceUris, schema);
       }
       if (writeDisposition == JobInfo.WriteDisposition.WRITE_TRUNCATE) {
         updateMetadataIfNeeded();
       }
-      logger.info("Data has been successfully loaded to BigQuery");
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     } finally {
-      cleanTemporaryGcsPathIfNeeded();
+      cleanTemporaryGcsPathIfNeeded(epochId);
     }
-  }
-
-  @Override
-  public void abort(WriterCommitMessageContext[] messages) {
-    try {
-      logger.warn(
-          "Aborting write {} for table {}",
-          writeUUID,
-          BigQueryUtil.friendlyTableName(config.getTableId()));
-    } finally {
-      cleanTemporaryGcsPathIfNeeded();
-    }
-  }
-
-  @Override
-  public void setTableInfo(TableInfo tableInfo) {
-    this.tableInfo = Optional.ofNullable(tableInfo);
   }
 
   void loadDataToBigQuery(List<String> sourceUris, Schema schema) throws IOException {
@@ -202,7 +229,7 @@ public class BigQueryIndirectDataSourceWriterContext implements DataSourceWriter
     BigQueryWriteHelper.updateTableMetadataIfNeeded(sparkSchema, config, bigQueryClient);
   }
 
-  void cleanTemporaryGcsPathIfNeeded() {
-    intermediateDataCleaner.ifPresent(cleaner -> cleaner.deletePath());
+  void cleanTemporaryGcsPathIfNeeded(long epochId) {
+    intermediateDataCleaner.ifPresent(cleaner -> cleaner.deleteEpochPath(epochId));
   }
 }

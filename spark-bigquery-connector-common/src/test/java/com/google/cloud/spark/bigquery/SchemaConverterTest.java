@@ -197,7 +197,7 @@ public class SchemaConverterTest {
     return Field.newBuilder(
             "foo",
             LegacySQLTypeName.RECORD,
-            Field.of("key", LegacySQLTypeName.INTEGER),
+            Field.newBuilder("key", LegacySQLTypeName.INTEGER).setMode(Mode.REQUIRED).build(),
             Field.of("value", LegacySQLTypeName.STRING))
         .setMode(Mode.REPEATED)
         .build();
@@ -467,7 +467,7 @@ public class SchemaConverterTest {
             .convert(getKeyValueRepeatedField());
     StructType elementType =
         new StructType()
-            .add("key", DataTypes.LongType, true)
+            .add("key", DataTypes.LongType, false)
             .add("value", DataTypes.StringType, true);
     ArrayType arrayType = new ArrayType(elementType, true);
     assertThat(field.dataType()).isEqualTo(arrayType);
@@ -742,6 +742,20 @@ public class SchemaConverterTest {
           Field.newBuilder("_PARTITIONDATE", LegacySQLTypeName.DATE)
               .setMode(Field.Mode.NULLABLE)
               .build());
+
+  @Test
+  public void testSchemaConvertersConfigurationEnableArrowTimestampRebase() {
+    SchemaConvertersConfiguration config = SchemaConvertersConfiguration.of(true, 38, 9, false);
+    assertThat(config.getEnableArrowTimestampRebase()).isFalse();
+
+    SchemaConvertersConfiguration configDefault = SchemaConvertersConfiguration.createDefault();
+    assertThat(configDefault.getEnableArrowTimestampRebase()).isTrue();
+
+    SparkBigQueryConfig sparkConfig = new SparkBigQueryConfig();
+    // Default is true
+    assertThat(SchemaConvertersConfiguration.from(sparkConfig).getEnableArrowTimestampRebase())
+        .isTrue();
+  }
 
   private StructField simpleStructField(String name, DataType dataType) {
     return StructField.apply(name, dataType, /* nullable */ true, Metadata.empty());

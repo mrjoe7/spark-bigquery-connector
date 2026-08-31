@@ -53,7 +53,11 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Streams;
 import com.google.inject.ProvisionException;
+import java.io.IOException;
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.Date;
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
@@ -66,6 +70,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.TimeZone;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -75,12 +80,17 @@ import org.apache.spark.ml.feature.MinMaxScaler;
 import org.apache.spark.ml.feature.MinMaxScalerModel;
 import org.apache.spark.ml.feature.VectorAssembler;
 import org.apache.spark.ml.linalg.SQLDataTypes;
+import org.apache.spark.ml.linalg.Vector;
 import org.apache.spark.package$;
 import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Encoder;
 import org.apache.spark.sql.Encoders;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SaveMode;
+import org.apache.spark.sql.execution.streaming.MemoryStream;
+import org.apache.spark.sql.streaming.OutputMode;
+import org.apache.spark.sql.streaming.StreamingQuery;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.Decimal;
@@ -94,7 +104,9 @@ import org.junit.Assert;
 import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
+import scala.Option;
 import scala.Some;
+import scala.collection.JavaConverters;
 
 abstract class WriteIntegrationTestBase extends SparkBigQueryIntegrationTestBase {
 
@@ -606,6 +618,91 @@ abstract class WriteIntegrationTestBase extends SparkBigQueryIntegrationTestBase
         .save(testDataset + "." + destTableName);
     int numOfRows = testTableNumberOfRows(destTableName);
     assertThat(numOfRows).isEqualTo(1);
+  }
+
+  @Test
+  public void testInDirectWriteToBigQueryWithStreaming() throws TimeoutException, IOException {
+    assumeThat(writeMethod, equalTo(WriteMethod.INDIRECT));
+
+    // Skipping test for spark 4: only works for spark 3 for now.
+    String sparkVersion = package$.MODULE$.SPARK_VERSION();
+    Assume.assumeThat(sparkVersion, CoreMatchers.startsWith("3."));
+
+    Path inputDir = Files.createTempDirectory("bq_integration_test_input");
+    Path jsonFile = inputDir.resolve("test_data_for_streaming.json");
+    Files.write(jsonFile, "{\"name\": \"spark\", \"age\": 100}".getBytes(StandardCharsets.UTF_8));
+
+    StructType schema =
+        new StructType().add("name", DataTypes.StringType).add("age", DataTypes.LongType);
+    Dataset<Row> df =
+        spark.readStream().option("multiline", "true").schema(schema).json(inputDir.toString());
+
+    String destTableName = testDataset + "." + "test_stream_json_" + System.nanoTime();
+    String checkPointLocation =
+        Files.createTempDirectory("bq_integration_test_checkpoint").toString();
+
+    StreamingQuery writeStream =
+        df.writeStream()
+            .format("bigquery")
+            .outputMode(OutputMode.Append())
+            .option("temporaryGcsBucket", TestConstants.TEMPORARY_GCS_BUCKET)
+            .option("checkpointLocation", checkPointLocation)
+            .option("table", destTableName)
+            .start();
+    writeStream.processAllAvailable();
+    writeStream.stop();
+
+    List<Row> rows = spark.read().format("bigquery").load(destTableName).collectAsList();
+    assertThat(rows).hasSize(1);
+    Row row = rows.get(0);
+    assertThat(row.getString(0)).isEqualTo("spark");
+    assertThat(row.getLong(1)).isEqualTo(100L);
+  }
+
+  @Test
+  public void testInDirectWriteToBigQueryWithStreaming_AllTypes()
+      throws IOException, TimeoutException {
+    // Skipping test for spark 4: only works for spark 3.5 for now.
+    String sparkVersion = package$.MODULE$.SPARK_VERSION();
+    Assume.assumeThat(sparkVersion, CoreMatchers.startsWith("3.5"));
+
+    StructType schema = TestConstants.ALL_TYPES_TABLE_SCHEMA;
+    Row row = TestConstants.ALL_TYPES_TABLE_ROW;
+    List<Row> rawRows = Collections.nCopies(20, row);
+
+    Dataset<Row> normalizedDF = spark.createDataFrame(rawRows, schema);
+    List<Row> rows = normalizedDF.collectAsList();
+    Encoder<Row> encoder = normalizedDF.encoder();
+
+    MemoryStream<Row> memoryStream =
+        new MemoryStream<>(
+            1, // id
+            spark.sqlContext(), // sqlContext
+            Option.apply(null),
+            encoder // Implicit encoder passed as final arg
+            );
+    memoryStream.addData(JavaConverters.asScalaBuffer(rows).toSeq());
+
+    String destTableName = testDataset + "." + "test_streaming_allTypes" + System.nanoTime();
+    String checkPointLocation =
+        Files.createTempDirectory("bq_integration_test_streaming_checkpoint").toString();
+
+    StreamingQuery writeStream =
+        memoryStream
+            .toDF()
+            .writeStream()
+            .format("bigquery")
+            .outputMode(OutputMode.Append())
+            .option("temporaryGcsBucket", TestConstants.TEMPORARY_GCS_BUCKET)
+            .option("checkpointLocation", checkPointLocation)
+            .option("table", destTableName)
+            .start();
+    writeStream.processAllAvailable();
+    writeStream.stop();
+
+    List<Row> readRows = spark.read().format("bigquery").load(destTableName).collectAsList();
+    assertThat(readRows).hasSize(20);
+    assertThat(readRows.get(0)).isEqualTo(rows.get(0));
   }
 
   private void writeDFNullableToBigQueryNullable_Internal(String writeAtLeastOnce)
@@ -2592,8 +2689,7 @@ abstract class WriteIntegrationTestBase extends SparkBigQueryIntegrationTestBase
     List<Row> values = result.collectAsList();
     assertThat(values).hasSize(3);
     Row row = values.get(0);
-    assertThat(row.get(row.fieldIndex("features")))
-        .isInstanceOf(org.apache.spark.ml.linalg.Vector.class);
+    assertThat(row.get(row.fieldIndex("features"))).isInstanceOf(Vector.class);
   }
 
   @Test
@@ -2741,5 +2837,290 @@ abstract class WriteIntegrationTestBase extends SparkBigQueryIntegrationTestBase
   // the equivalent of Java 11 Predicate.not()
   static <T> Predicate<T> not(Predicate<T> predicate) {
     return predicate.negate();
+  }
+
+  @Test
+  public void testCdcAppend() throws Exception {
+    assumeThat(writeMethod, equalTo(WriteMethod.DIRECT));
+
+    String destTableName = testDataset + "." + testTable;
+    String ddl =
+        String.format(
+            "CREATE TABLE %s (id INT64, name STRING, PRIMARY KEY(id) NOT ENFORCED)", destTableName);
+    IntegrationTestUtils.runQuery(ddl);
+
+    // Using lowercase `_change_type` to test Phase 2 case-mapping under the hood
+    StructType schema =
+        new StructType()
+            .add("id", DataTypes.LongType)
+            .add("name", DataTypes.StringType)
+            .add("_change_type", DataTypes.StringType);
+
+    List<Row> rows =
+        Arrays.asList(
+            RowFactory.create(1L, "foo", "UPSERT"), RowFactory.create(2L, "bar", "UPSERT"));
+    Dataset<Row> df = spark.createDataFrame(rows, schema);
+
+    df.write()
+        .format("bigquery")
+        .mode(SaveMode.Append)
+        .option("writeMethod", "direct")
+        .option("writeAtLeastOnce", "true")
+        .save(destTableName);
+
+    int numOfRows = testTableNumberOfRows(testTable);
+    assertThat(numOfRows).isEqualTo(2);
+
+    // Send a DELETE for one of the rows
+    List<Row> rows2 = Arrays.asList(RowFactory.create(1L, "foo", "DELETE"));
+    Dataset<Row> df2 = spark.createDataFrame(rows2, schema);
+    df2.write()
+        .format("bigquery")
+        .mode(SaveMode.Append)
+        .option("writeMethod", "direct")
+        .option("writeAtLeastOnce", "true")
+        .save(destTableName);
+
+    numOfRows = testTableNumberOfRows(testTable);
+    assertThat(numOfRows).isEqualTo(1);
+  }
+
+  @Test
+  public void testCdcFailsWhenIndirectWriteMethod() {
+    assumeThat(writeMethod, equalTo(WriteMethod.INDIRECT));
+
+    String destTableName = testDataset + "." + testTable;
+    StructType schema =
+        new StructType().add("id", DataTypes.LongType).add("_CHANGE_TYPE", DataTypes.StringType);
+    Dataset<Row> df =
+        spark.createDataFrame(Collections.singletonList(RowFactory.create(1L, "UPSERT")), schema);
+
+    Exception e =
+        assertThrows(
+            Exception.class,
+            () -> {
+              df.write()
+                  .format("bigquery")
+                  .mode(SaveMode.Append)
+                  .option("writeMethod", "indirect")
+                  .option("temporaryGcsBucket", TestConstants.TEMPORARY_GCS_BUCKET)
+                  .save(destTableName);
+            });
+    boolean found = false;
+    Throwable t = e;
+    while (t != null) {
+      if (t instanceof IllegalArgumentException
+          && t.getMessage()
+              .contains(
+                  "CDC is only supported when writeMethod is DIRECT and writeAtLeastOnce is true")) {
+        found = true;
+        break;
+      }
+      t = t.getCause();
+    }
+    assertThat(found).isTrue();
+  }
+
+  @Test
+  public void testCdcFailsWhenDirectButNotAtLeastOnce() {
+    assumeThat(writeMethod, equalTo(WriteMethod.DIRECT));
+
+    String destTableName = testDataset + "." + testTable;
+    StructType schema =
+        new StructType().add("id", DataTypes.LongType).add("_CHANGE_TYPE", DataTypes.StringType);
+    Dataset<Row> df =
+        spark.createDataFrame(Collections.singletonList(RowFactory.create(1L, "UPSERT")), schema);
+
+    Exception e =
+        assertThrows(
+            Exception.class,
+            () -> {
+              df.write()
+                  .format("bigquery")
+                  .mode(SaveMode.Append)
+                  .option("writeMethod", "direct")
+                  .option("writeAtLeastOnce", "false")
+                  .save(destTableName);
+            });
+    boolean found = false;
+    Throwable t = e;
+    while (t != null) {
+      if (t instanceof IllegalArgumentException
+          && t.getMessage()
+              .contains(
+                  "CDC is only supported when writeMethod is DIRECT and writeAtLeastOnce is true")) {
+        found = true;
+        break;
+      }
+      t = t.getCause();
+    }
+    assertThat(found).isTrue();
+  }
+
+  @Test
+  public void testCdcFailsWhenTableDoesNotExist() {
+    assumeThat(writeMethod, equalTo(WriteMethod.DIRECT));
+
+    String destTableName = testDataset + "." + testTable;
+    StructType schema =
+        new StructType().add("id", DataTypes.LongType).add("_CHANGE_TYPE", DataTypes.StringType);
+    Dataset<Row> df =
+        spark.createDataFrame(Collections.singletonList(RowFactory.create(1L, "UPSERT")), schema);
+
+    Exception e =
+        assertThrows(
+            Exception.class,
+            () -> {
+              df.write()
+                  .format("bigquery")
+                  .mode(SaveMode.Append)
+                  .option("writeMethod", "direct")
+                  .option("writeAtLeastOnce", "true")
+                  .save(destTableName);
+            });
+    boolean found = false;
+    Throwable t = e;
+    while (t != null) {
+      if (t instanceof IllegalArgumentException
+          && t.getMessage().contains("CDC can only be written to an existing table")) {
+        found = true;
+        break;
+      }
+      t = t.getCause();
+    }
+    assertThat(found).isTrue();
+  }
+
+  @Test
+  public void testCdcFailsWithPartitionDecorator() throws Exception {
+    assumeThat(writeMethod, equalTo(WriteMethod.DIRECT));
+
+    String baseTableName = testDataset + "." + testTable;
+    String ddl =
+        String.format(
+            "CREATE TABLE %s (id INT64, name STRING, partition_date DATE, PRIMARY KEY(id) NOT ENFORCED) PARTITION BY partition_date",
+            baseTableName);
+    IntegrationTestUtils.runQuery(ddl);
+
+    String destTableName = baseTableName + "$20230101";
+    StructType schema =
+        new StructType()
+            .add("id", DataTypes.LongType)
+            .add("name", DataTypes.StringType)
+            .add("partition_date", DataTypes.DateType)
+            .add("_CHANGE_TYPE", DataTypes.StringType);
+    Dataset<Row> df =
+        spark.createDataFrame(
+            Collections.singletonList(
+                RowFactory.create(1L, "foo", java.sql.Date.valueOf("2023-01-01"), "UPSERT")),
+            schema);
+
+    Exception e =
+        assertThrows(
+            Exception.class,
+            () -> {
+              df.write()
+                  .format("bigquery")
+                  .mode(SaveMode.Append)
+                  .option("writeMethod", "direct")
+                  .option("writeAtLeastOnce", "true")
+                  .save(destTableName);
+            });
+    boolean found = false;
+    Throwable t = e;
+    while (t != null) {
+      if (t instanceof IllegalArgumentException
+          && t.getMessage()
+              .contains(
+                  "CDC cannot be used with a partition decorator ($). Write to the base table.")) {
+        found = true;
+        break;
+      }
+      t = t.getCause();
+    }
+    assertThat(found).isTrue();
+  }
+
+  @Test
+  public void testCdcFailsWithInvalidChangeType() throws Exception {
+    assumeThat(writeMethod, equalTo(WriteMethod.DIRECT));
+
+    String destTableName = testDataset + "." + testTable;
+    String ddl =
+        String.format(
+            "CREATE TABLE %s (id INT64, name STRING, PRIMARY KEY(id) NOT ENFORCED)", destTableName);
+    IntegrationTestUtils.runQuery(ddl);
+
+    StructType schema =
+        new StructType()
+            .add("id", DataTypes.LongType)
+            .add("name", DataTypes.StringType)
+            .add("_CHANGE_TYPE", DataTypes.StringType);
+    Dataset<Row> df =
+        spark.createDataFrame(
+            Collections.singletonList(RowFactory.create(1L, "foo", "INSERT")), schema);
+
+    Exception e =
+        assertThrows(
+            Exception.class,
+            () -> {
+              df.write()
+                  .format("bigquery")
+                  .mode(SaveMode.Append)
+                  .option("writeMethod", "direct")
+                  .option("writeAtLeastOnce", "true")
+                  .save(destTableName);
+            });
+
+    boolean found = false;
+    Throwable t = e;
+    while (t != null) {
+      if (t instanceof IllegalArgumentException
+          && t.getMessage().contains("CDC _CHANGE_TYPE must be UPSERT or DELETE")) {
+        found = true;
+        break;
+      }
+      t = t.getCause();
+    }
+    assertThat(found).isTrue();
+  }
+
+  @Test
+  public void testCdcFailsWithOverwrite() throws Exception {
+    assumeThat(writeMethod, equalTo(WriteMethod.DIRECT));
+
+    String destTableName = testDataset + "." + testTable;
+    String ddl =
+        String.format(
+            "CREATE TABLE %s (id INT64, name STRING, PRIMARY KEY(id) NOT ENFORCED)", destTableName);
+    IntegrationTestUtils.runQuery(ddl);
+
+    StructType schema =
+        new StructType().add("id", DataTypes.LongType).add("_CHANGE_TYPE", DataTypes.StringType);
+    Dataset<Row> df =
+        spark.createDataFrame(Collections.singletonList(RowFactory.create(1L, "UPSERT")), schema);
+
+    Exception e =
+        assertThrows(
+            Exception.class,
+            () -> {
+              df.write()
+                  .format("bigquery")
+                  .mode(SaveMode.Overwrite)
+                  .option("writeMethod", "direct")
+                  .option("writeAtLeastOnce", "true")
+                  .save(destTableName);
+            });
+    boolean found = false;
+    Throwable t = e;
+    while (t != null) {
+      if (t instanceof IllegalArgumentException
+          && t.getMessage().contains("CDC can only be used with SaveMode.Append")) {
+        found = true;
+        break;
+      }
+      t = t.getCause();
+    }
+    assertThat(found).isTrue();
   }
 }

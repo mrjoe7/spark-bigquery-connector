@@ -206,6 +206,11 @@ public class SparkBigQueryConfig
   com.google.common.base.Optional<String> temporaryGcsBucket = empty();
   com.google.common.base.Optional<String> persistentGcsBucket = empty();
   com.google.common.base.Optional<String> persistentGcsPath = empty();
+  // These properties are used to configure the catalog specifically, allowing
+  // separation between the catalog's project/location and the job's billing/execution
+  // project/location.
+  com.google.common.base.Optional<String> catalogProjectId = empty();
+  com.google.common.base.Optional<String> catalogLocation = empty();
 
   IntermediateFormat intermediateFormat = DEFAULT_INTERMEDIATE_FORMAT;
   DataFormat readDataFormat = DEFAULT_READ_DATA_FORMAT;
@@ -258,6 +263,7 @@ public class SparkBigQueryConfig
   private com.google.common.base.Optional<String> destinationTableKmsKeyName = empty();
 
   private boolean allowMapTypeConversion = ALLOW_MAP_TYPE_CONVERSION_DEFAULT;
+  private boolean enableArrowTimestampRebase = true;
   private long bigQueryJobTimeoutInMinutes = BIGQUERY_JOB_TIMEOUT_IN_MINUTES_DEFAULT;
   private com.google.common.base.Optional<String> gpn;
   private int bigNumericDefaultPrecision;
@@ -424,6 +430,8 @@ public class SparkBigQueryConfig
 
     config.parentProjectId =
         getAnyOption(globalOptions, options, "parentProject").or(defaultBilledProject());
+    config.catalogProjectId = getOption(options, "projectId");
+    config.catalogLocation = getOption(options, "bigquery_location");
     config.useParentProjectForMetadataOperations =
         getAnyBooleanOption(globalOptions, options, "useParentProjectForMetadataOperations", false);
     config.accessTokenProviderFQCN = getAnyOption(globalOptions, options, "gcpAccessTokenProvider");
@@ -680,6 +688,9 @@ public class SparkBigQueryConfig
             .transform(Boolean::valueOf)
             .or(ALLOW_MAP_TYPE_CONVERSION_DEFAULT);
 
+    config.enableArrowTimestampRebase =
+        getAnyBooleanOption(globalOptions, options, "enableArrowTimestampRebase", true);
+
     config.partitionOverwriteModeValue =
         getAnyOption(globalOptions, options, partitionOverwriteModeProperty)
             .transform(String::toUpperCase)
@@ -872,6 +883,16 @@ public class SparkBigQueryConfig
   @Override
   public String getParentProjectId() {
     return parentProjectId;
+  }
+
+  @Override
+  public Optional<String> getCatalogProjectId() {
+    return catalogProjectId.toJavaUtil();
+  }
+
+  @Override
+  public Optional<String> getCatalogLocation() {
+    return catalogLocation.toJavaUtil();
   }
 
   @Override
@@ -1191,6 +1212,10 @@ public class SparkBigQueryConfig
     return allowMapTypeConversion;
   }
 
+  public boolean getEnableArrowTimestampRebase() {
+    return enableArrowTimestampRebase;
+  }
+
   public long getBigQueryJobTimeoutInMinutes() {
     return bigQueryJobTimeoutInMinutes;
   }
@@ -1240,6 +1265,7 @@ public class SparkBigQueryConfig
         .setEnableReadSessionCaching(enableReadSessionCaching)
         .setReadSessionCacheDurationMins(readSessionCacheDurationMins)
         .setSnapshotTimeMillis(getSnapshotTimeMillis())
+        .setEnableArrowTimestampRebase(enableArrowTimestampRebase)
         .build();
   }
 
@@ -1273,6 +1299,11 @@ public class SparkBigQueryConfig
       @Override
       public int expirationTimeInMinutes() {
         return SparkBigQueryConfig.this.getMaterializationExpirationTimeInMinutes();
+      }
+
+      @Override
+      public Optional<String> getKmsKeyName() {
+        return SparkBigQueryConfig.this.getKmsKeyName();
       }
     };
   }
